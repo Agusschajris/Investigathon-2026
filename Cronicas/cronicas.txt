@@ -5,3 +5,13 @@ Output:
   Mejor recompensa acumulada: -inf
   Archivos guardados en: ./checkpoints/
 ======================================================================
+
+24/10/26 - Run 6 completada (output7.log) — 1000 episodios, A2C+GAE+coef_valor fix
+  Mejor score banco: -0.1551 (ep 448, conn=0.356, r=0.836)
+  Conn media: 0.361 (igual que azar — agente no aprendió a subir conectividad)
+  gNorm media: 13.84 — gradientes explotando en todos los episodios
+  Diagnóstico: toggle destruye conectividad, distributional shift train/eval,
+               reward absoluto no da crédito por arista individual
+  Próximo: Gen 2 — solo-añadir con máscara, mismo omega train/eval, reward delta
+  Análisis completo: analisis/analisis_2026-10-24_run6.md
+  Propuestas Gen 2: analisis/gen2_propuestas.txt

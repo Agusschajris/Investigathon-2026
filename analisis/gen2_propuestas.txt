@@ -1,0 +1,357 @@
+================================================================================
+  GEN 2 — ANÁLISIS DEL COMPORTAMIENTO REAL DE LA RED Y PROPUESTAS DE CAMBIO
+  Fecha: 2026-10-24
+  Contexto: basado en output7.log (Run 6, 1000 episodios)
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PARTE 1: QUÉ ESTÁ HACIENDO LA RED CON EXACTITUD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1.1 ¿LOS GRAFOS QUE MUESTRA SINCRONIZAN?
+─────────────────────────────────────────
+
+SÍ. Casi todos sincronizan. Los datos exactos de Run 6:
+
+  r_final > 0.9  :  ~73% de los episodios  → sincronización casi completa
+  r_final 0.8-0.9:  ~15% de los episodios  → sincronización alta
+  r_final 0.7-0.8:   ~7% de los episodios  → sincronización moderada
+  r_final 0.5-0.7:   ~3% de los episodios  → sincronización parcial
+  r_final < 0.5  :  ~1.8% de los episodios → desincronización (los mejores)
+
+El parámetro de orden r mide exactamente qué tan sincronizados están los
+osciladores. r = |mean(exp(i*theta))| donde theta es la fase de cada nodo:
+  - r ≈ 1.0: todos los osciladores tienen la misma fase → sincronizados
+  - r ≈ 0.0: las fases están distribuidas uniformemente → desincronizados
+
+El objetivo del problema es MAXIMIZAR la desincronización (minimizar r) mientras
+se mantiene una conectividad alta. El score = conectividad - r. Para que
+score > 0, necesitamos conn > r, es decir: un grafo que sea muy conectado
+(conn ≈ 0.7+) pero que sus osciladores no se sincronicen (r ≈ 0).
+
+La búsqueda aleatoria encontró tal grafo: conn ≈ 0.64, r ≈ 0 → score ≈ +0.09.
+La red neuronal nunca encontró este tipo de grafo. En 1000 episodios de Run 6,
+el mejor fue conn=0.356, r=0.836 → score = -0.155.
+
+
+1.2 QUÉ HACE LA RED PASO A PASO
+─────────────────────────────────
+
+En cada paso del episodio (hay 30 pasos por episodio), la red:
+
+  1. OBSERVA: las fases actuales theta (en forma sin/cos), las frecuencias
+     naturales omega, y el grafo actual W (matriz de adyacencia).
+
+  2. DECIDE: produce una distribución de probabilidad sobre las 45 posibles
+     aristas del grafo (para N=10 nodos). La arista con mayor probabilidad
+     es la más "probable" de ser seleccionada.
+
+  3. ACTÚA: selecciona una arista (con probabilidad épsilon hace una acción
+     aleatoria). Aplica el mecanismo TOGGLE: si la arista ya existe, la elimina;
+     si no existe, la agrega.
+
+  4. RECIBE RECOMPENSA: evalúa el grafo resultante con una simulación rápida
+     de Kuramoto (2 segundos). El reward = conectividad - r_simulado.
+
+Problema concreto observado: la red está haciendo toggles casi aleatorios.
+La conectividad media (0.361) coincide exactamente con lo que produciría
+una política uniforme aleatoria. Esto confirma que la red no ha aprendido
+ninguna estrategia diferenciada.
+
+
+1.3 POR QUÉ NO APRENDE A SUBIR LA CONECTIVIDAD
+────────────────────────────────────────────────
+
+El mecanismo TOGGLE es el obstáculo directo. Cuando la red aprende
+"agregar arista X da buena recompensa", en el siguiente paso puede
+volver a seleccionar X (ahora presente), eliminándola, y eso también
+recibe recompensa positiva (porque si la arista es buena, quitarla
+también cambia algo). La señal es contradictoria.
+
+Matemáticamente: con 30 pasos y toggle uniforme, la fracción esperada de
+aristas ON al final es:
+
+  P(arista ON) = 1/2 × (1 - exp(-2 × n_visitas))
+
+Con 30 pasos y 45 aristas, cada arista se visita ~0.67 veces en promedio.
+P(arista ON) ≈ 0.367
+
+Que es exactamente lo observado (0.361). La red no está haciendo nada
+mejor que azar puro en términos de conectividad.
+
+
+1.4 POR QUÉ NO APRENDE A DESINCRONIZAR
+────────────────────────────────────────
+
+Para desincronizar un grafo Kuramoto con omega homogéneo (rango 1.0),
+se necesita una topología muy específica: grafos donde las "comunidades"
+de nodos tengan frecuencias heterogéneas y pocas conexiones entre ellas.
+No cualquier grafo denso desincroniza.
+
+La red necesitaría aprender: "dado este conjunto de omegas, agregar la
+arista (i,j) aumenta o disminuye la sincronización." Esta es una relación
+no local y no lineal: depende de TODA la topología existente, no solo del
+par (i,j). La GCN actual hace exactamente una suma ponderada de features de
+vecinos, que es una operación lineal. Para capturar efectos de desincronización
+globales, se necesita algo más expresivo.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PARTE 2: PROPUESTAS PARA GEN 2 — EN ORDEN DE PRIORIDAD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRIORIDAD ALTA — cambios que atacan el problema directamente
+════════════════════════════════════════════════════════════════════════════════
+
+CAMBIO A: REEMPLAZAR TOGGLE POR ACCIÓN SOLO-AÑADIR CON PRESUPUESTO FIJO
+────────────────────────────────────────────────────────────────────────
+
+  Problema que resuelve: la conectividad nunca sube de 0.36 porque el toggle
+  permite al agente deshacer sus propias aristas. La cota inferior de 0.69
+  nunca se alcanza con toggle.
+
+  Implementación:
+    - El agente solo puede AGREGAR aristas (nunca eliminar).
+    - Se le da un presupuesto de K aristas (K = número deseado para conn target).
+    - Para conn ≥ 0.69 con N=10: necesitamos ≥ 31 aristas, K = 31.
+    - El agente selecciona K aristas distintas de las 45 posibles.
+    - Una vez seleccionada una arista, desaparece del espacio de acciones.
+
+  Implementación concreta en código:
+    - Agregar máscara M de tamaño NUM_ACCIONES (1 = disponible, 0 = ya usada).
+    - En cada paso: aplicar softmax solo sobre acciones con M=1 (mask + softmax).
+    - Agregar M como feature de entrada al modelo (vector de 45 bits).
+    - Parar el episodio cuando M esté vacía o se alcancen K pasos.
+
+  Cambio en preparar_entradas():
+    features_nodo = [sin(theta), cos(theta), omega]   # sin cambio
+    features_grafo = M.reshape(1, NUM_ACCIONES)       # NUEVO: máscara de aristas
+
+  Cambio en model.py: agregar una segunda entrada de forma (NUM_ACCIONES,)
+  que se concatena al vector global ANTES de la cabeza del actor:
+    x_global = concat([global_pool_output, mascara_input])
+
+  GARANTÍA: con K=31 pasos y solo-añadir, conn ≥ 0.69 es 100% alcanzable.
+  El agente aprende QUÉ 31 aristas (de las 45) construyen el mejor grafo.
+
+
+CAMBIO B: SEPARAR ENTRENAMIENTO DE EVALUACIÓN — MISMO OMEGA PARA AMBAS
+────────────────────────────────────────────────────────────────────────
+
+  Problema que resuelve: el agente se entrena con omega_train (rango 2.0)
+  pero se evalúa con el banco (rango 1.0). Hay distributional shift entre
+  entrenamiento y evaluación. El agente aprende topologías que funcionan
+  para omega muy heterogéneo pero no funcionan en el banco.
+
+  Solución:
+    - Usar el mismo omega del banco en el entrenamiento. Rotar entre los 10
+      omega del banco: omega_train = BANCO_OMEGA[episodio % 10].
+    - O bien: unificar el rango — OMEGA_RANGE_TRAIN = OMEGA_RANGE = 1.0.
+    - Esto hace que el agente aprenda a desincronizar exactamente el tipo
+      de instancias en las que será evaluado.
+
+  Trade-off: menos diversidad en entrenamiento. Mitigación: con el cambio A
+  (más pasos, más aristas), la diversidad viene del grafo, no del omega.
+
+
+CAMBIO C: REWARD DIFERENCIAL (DELTA SCORE) EN LUGAR DE SCORE ABSOLUTO
+──────────────────────────────────────────────────────────────────────
+
+  Problema que resuelve: el reward denso actual da score_absoluto en cada paso.
+  Si el grafo tiene score = −0.45, todos los pasos reciben ≈ −0.45 como reward.
+  El agente no puede distinguir qué arista MEJORÓ el grafo respecto a no añadirla.
+
+  Solución:
+    r_t = score(W_t) - score(W_{t-1})    ← delta score
+
+  Si agregar la arista X mejoró el score en 0.02, r_t = +0.02.
+  Si empeoró en 0.03, r_t = −0.03.
+  El agente aprende directamente: "esta arista ayuda, esta arista daña."
+
+  Esta es la forma de reward más informativa posible para un problema
+  de construcción incremental de grafos. Requiere evaluar el grafo DOS
+  veces por paso (antes y después), pero con SECS_RAPIDO el costo es
+  manejable.
+
+  Combinado con el cambio A (solo-añadir), esto se simplifica aún más:
+    r_t = score(W + arista_t) - score(W)
+  Que mide exactamente la contribución marginal de cada arista añadida.
+
+
+PRIORIDAD MEDIA — mejoras de arquitectura del modelo
+════════════════════════════════════════════════════════════════════════════════
+
+CAMBIO D: AGREGAR FEATURES DE ARISTA A LA GCN
+───────────────────────────────────────────────
+
+  Problema que resuelve: la GCN actual solo tiene features de NODO
+  (sin/cos theta, omega). No tiene información sobre qué par de nodos
+  conectaría cada acción potencial.
+
+  Solución: agregar al vector de decisión del actor, para cada arista (i,j),
+  las features del par de nodos:
+    - |omega_i - omega_j|: diferencia de frecuencias (alta diferencia → más
+      probable que desincronizar)
+    - |theta_i - theta_j|: diferencia de fases actual
+    - grado_i + grado_j: suma de grados (penaliza agregar a nodos ya muy conectados)
+
+  Implementación: en lugar de una capa Dense que mapea el vector global a
+  45 logits, usar un modelo de 2 ramas:
+    rama_global: x_global → Dense(64)
+    rama_arista: feature_arista_k → Dense(32), para k in 1..45
+    logit_k = dot(rama_global, rama_arista_k)
+
+  Esto permite al actor razonar sobre CADA arista individualmente,
+  en lugar de mapear un vector global a 45 scores de forma no estructurada.
+
+
+CAMBIO E: AUMENTAR PROFUNDIDAD DE LA GCN (3 CAPAS)
+────────────────────────────────────────────────────
+
+  La GCN actual tiene 2 capas: puede propagar información a distancia 2
+  (vecinos de vecinos). Para N=10 nodos, se necesitan 3-4 capas para que
+  la información de un nodo llegue a todos los demás.
+
+  Con 2 capas: nodo i ve información de nodos a distancia ≤ 2.
+  Con 3 capas: nodo i ve información de nodos a distancia ≤ 3.
+  Con grafos de N=10, 3 capas capturan la estructura global completa.
+
+  Cambio en model.py:
+    x = GCNConvLayer(128, activation='relu', name='gcn_1')([node_in, W_in])
+    x = GCNConvLayer(64,  activation='relu', name='gcn_2')([x, W_in])
+    x = GCNConvLayer(64,  activation='relu', name='gcn_3')([x, W_in])  # NUEVO
+    x = GlobalSumPool(name='global_pool')(x)
+
+
+CAMBIO F: REEMPLAZAR SUMA GLOBAL POR ATENCIÓN GLOBAL
+──────────────────────────────────────────────────────
+
+  GlobalSumPool pierde información sobre nodos individuales. Si dos grafos
+  tienen los mismos features de nodo pero distribuidos diferente, dan el
+  mismo vector global (porque la suma es conmutativa). La atención solucion esto.
+
+  Usar Global Attention Pooling:
+    score_nodo_k = Dense(1)(h_k)          # "importancia" de cada nodo
+    alpha_k = softmax(score_nodo_k)
+    x_global = sum(alpha_k × h_k)
+
+  Esto permite que el modelo aprenda qué nodos importan más para decidir
+  la próxima arista a agregar.
+
+
+PRIORIDAD ALTA ALTERNATIVA — cambio de paradigma completo
+════════════════════════════════════════════════════════════════════════════════
+
+CAMBIO G: GENERACIÓN DIRECTA DEL GRAFO (NO SECUENCIAL)
+────────────────────────────────────────────────────────
+
+  Este es el cambio más grande pero con el mayor potencial. En lugar de
+  construir el grafo arista a arista (secuencial, 30 pasos), generar el
+  grafo completo en UNA sola pasada.
+
+  Arquitectura:
+    ENTRADA: features de nodos (N, 3) = [sin(theta), cos(theta), omega]
+    GCN trunk: produce embeddings de nodo (N, H)
+    Cabeza de arista: para cada par (i,j), score = dot(h_i, h_j) → logit
+    Política: distribución Bernoulli sobre las 45 aristas
+    SALIDA: grafo W ∈ {0,1}^45 sampleado de la política
+
+  Entrenamiento con REINFORCE de un solo paso:
+    1. Samplear grafo W desde política π_θ
+    2. Evaluar score(W, omega) con simulación completa
+    3. Gradiente: ∇θ log π_θ(W) × score(W)  (sin baseline critic)
+    4. Con baseline de línea de base (media móvil): gradiente más estable
+
+  VENTAJAS vs A2C secuencial:
+    - No hay problema de asignación de crédito (una sola acción = el grafo completo)
+    - No hay mecanismo de toggle → conectividad directamente controlable
+    - El espacio de política es exactamente el espacio de grafos (2^45)
+    - Puede usar gradient estimators mejores: REINFORCE with baseline,
+      NVIL, o incluso variantes continuas (Gumbel-softmax)
+
+  DESVENTAJA: requiere más muestras para converger (no usa la estructura
+  secuencial del problema). Mitigación: entrenar con mini-batches de varios
+  grafos por update de gradiente.
+
+  IMPLEMENTACIÓN MÍNIMA:
+
+    # En model.py:
+    node_in = Input(shape=(N, 3))
+    gcn_out = GCNConvLayer(128)(node_in, adjacencia_completa)  # A completa
+    # Para cada par (i,j): score_ij = h_i · h_j
+    scores = tf.einsum('bif,bjf->bij', gcn_out, gcn_out)  # (B, N, N)
+    # Tomar solo triángulo superior (aristas únicas)
+    logits = gather_upper_triangle(scores)  # (B, NUM_ACCIONES)
+    probs = tf.sigmoid(logits)              # Bernoulli, no softmax
+    # Samplear
+    W = tf.random.stateless_binomial(probs)
+
+    # En entrenamiento:
+    log_probs = sum(log p_ij × W_ij + log(1-p_ij) × (1-W_ij))
+    loss = -log_probs × (score - baseline)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PARTE 3: TABLA DE PRIORIZACIÓN PARA EL INVESTIGATHON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Cambio       | Impacto en conn | Impacto en r  | Dificultad | Tiempo est.
+──────────────────────────────────────────────────────────────────────────
+A (solo-añadir+máscara) | ALTO (≥0.69 garantizado) | Medio | Bajo  | 1-2h
+B (mismo omega train/eval) | Bajo | ALTO (reduce shift) | Muy bajo | 30min
+C (reward diferencial) | Bajo | ALTO (crédito exacto) | Bajo | 1h
+D (features de arista) | Bajo | Medio | Medio | 2-3h
+E (3 capas GCN) | Bajo | Bajo-Medio | Muy bajo | 20min
+F (atención global) | Bajo | Bajo-Medio | Medio | 2h
+G (generación directa) | ALTO | ALTO | Alto | 4-6h
+──────────────────────────────────────────────────────────────────────────
+
+RECOMENDACIÓN PARA GEN 2 (por impacto/esfuerzo):
+
+  PASO 1 (urgente, 30 min): Implementar cambio B.
+    Solo cambiar OMEGA_RANGE_TRAIN = OMEGA_RANGE = 1.0 en entrenamiento.
+    Elimina el distributional shift de forma inmediata.
+
+  PASO 2 (alta prioridad, 2h): Implementar cambio A.
+    Reemplazar toggle por solo-añadir con máscara dinámica.
+    Garantiza alcanzar la cota de conectividad (0.69).
+    Requiere modificar: aplicar_accion(), preparar_entradas(), model.py.
+
+  PASO 3 (alta prioridad, 1h): Implementar cambio C.
+    Cambiar reward a delta(score) en lugar de score absoluto.
+    Hace el aprendizaje más directo (crédito exacto por arista).
+    Requiere modificar: bucle de recolección en entrenamiento.py.
+
+  Con solo los cambios A+B+C estimamos que el agente debería:
+    - Conectividad media ≥ 0.50 (vs 0.36 actual)
+    - Mejores episodios con score ≥ 0 (superar baseline)
+    - Convergencia visible dentro de 500 episodios
+
+  PASO 4 (si hay tiempo): Cambio G (generación directa).
+    Es el rediseño correcto a largo plazo. Elimina todos los problemas
+    estructurales del enfoque secuencial de una vez.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NOTA SOBRE EL BASELINE Y EL PROBLEMA REAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+El baseline aleatorio (busqueda_aleatoria.py) encontró score = +0.093 con
+conn ≈ 0.64 y r ≈ 0. Ese grafo desincroniza porque para ESE omega específico
+(el que encontró la búsqueda aleatoria), esa topología produce trayectorias
+de Kuramoto que NO convergen a fase común.
+
+La existencia de ese grafo prueba que el problema tiene soluciones con
+score positivo. La GNN tiene que encontrarlas sistemáticamente, no por azar.
+
+Los cambios A+B+C de Gen 2 atacan exactamente eso:
+  A → garantiza explorar grafos con conn ≥ 0.69
+  B → entrena en la misma distribución que se evalúa
+  C → da señal directa de qué aristas contribuyen a la desincronización
+
+Con esas tres condiciones, un agente RL tiene una posibilidad real de
+aprender qué estructuras topológicas desincronizan el sistema Kuramoto.
+
+================================================================================
+Generado el 2026-10-24 a partir del análisis de output7.log (Run 6, 1000 ep)
+================================================================================
