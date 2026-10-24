@@ -1,43 +1,94 @@
+# -*- coding: utf-8 -*-
 import os
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 import json
 import numpy as np
 import tensorflow as tf
-import scipy.sparse as sp
 import config
-from funcion_recompensa import evaluar_grafo
+from funcion_recompensa import evaluar_grafo, evaluar_grafo_rapido
 from model import model
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Constantes del proyecto
 # ─────────────────────────────────────────────────────────────────────────────
 
-N            = config.N     # cantidad de nodos del grafo
-DT           = config.DT    # paso de tiempo de la simulación de Kuramoto
-SECS         = config.SECS  # segundos que dura cada simulación
-
-# Cantidad de aristas posibles en un grafo no dirigido sin lazos.
-# Cada par (i,j) con i < j es una acción posible del modelo.
+N            = config.N
+DT           = config.DT
+SECS         = config.SECS
+OMEGA_RANGE  = config.OMEGA_RANGE
 NUM_ACCIONES = int(N * (N - 1) / 2)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Hiperparámetros del entrenamiento
+#  Hiperparametros — Run 6
+#
+#  Cambios respecto a Run 5 (basados en analisis de output5.log / output6.log):
+#
+#    1. FIX RESUME: Run 6 (output6.log) termino sin entrenar ningun episodio.
+#       La causa: EPISODIO_INICIO=200 con range(200, 200) → vacio.
+#       Fix: EPISODIO_FIN = EPISODIO_INICIO + NUM_EPISODIOS siempre, de modo
+#       que cada run entrena exactamente NUM_EPISODIOS episodios nuevos sin
+#       importar el punto de partida.
+#
+#    2. COEF_VALOR 0.01 → 0.5 (FIX CRITICO ALGORITMICO):
+#       Con coef_valor=0.01 el critic recibe gradientes 50x mas pequeños que
+#       el actor. V(s) nunca converge → las ventajas GAE son casi puro ruido
+#       → los gradientes del actor son ruidosos → el agente no aprende nada.
+#       El valor estandar en A2C es 0.5 (ver Mnih et al. 2016, A3C paper).
+#       Esto es el cambio mas importante de esta run.
+#
+#    3. NUM_EPISODIOS 200 → 1000: 200 episodios × 30 pasos = 6000 updates,
+#       insuficiente para que A2C con GAE converja en un espacio de 45 aristas.
+#       Con 1000 episodios se dan 30000 updates con senales mas limpias.
+#
+#    4. FORWARD PASS VECTORIZADO: Run 5 llamaba al modelo 30+30 veces por
+#       episodio en bucles Python (30 para calcular valores GAE + 30 dentro
+#       del GradientTape). Ahora se hace UN solo forward pass por etapa:
+#       - preparar_batch() apila todos los estados del episodio en tensores
+#       - model([node_batch, W_batch]) procesa los 30 pasos de una vez
+#       Esto es ~30x mas rapido y reduce el overhead del grafo de TF.
+#
+#    5. EPSILON con decaimiento relativo al run actual: epsilon_actual() ahora
+#       decae desde EPSILON_INICIO a EPSILON_FIN sobre los episodios del run
+#       actual (no sobre indices absolutos), funcionando correctamente con resume.
+#
+#    6. CHECKPOINT_CADA 50 → 100: con 1000 episodios, guardar cada 50 es
+#       innecesario. Cada 100 reduce I/O sin perder granularidad util.
+#
+#    7. LOG con promedio movil de 20 eps y norma de gradiente: facilita ver
+#       si el entrenamiento esta mejorando y detectar explosiones de gradiente.
 # ─────────────────────────────────────────────────────────────────────────────
 
-NUM_EPISODIOS      = 200    # cantidad total de episodios de entrenamiento
-PASOS_POR_EPISODIO = 20     # modificaciones que hace el modelo por episodio
-GAMMA              = 0.99   # factor de descuento para los retornos
-TASA_APRENDIZAJE   = 1e-3   # learning rate del optimizador Adam
-CHECKPOINT_CADA    = 10     # guardar pesos del modelo cada N episodios
-CARPETA_CKPT       = "checkpoints"  # directorio donde se guardan los pesos
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Optimizador y directorio de checkpoints
-# ─────────────────────────────────────────────────────────────────────────────
+NUM_EPISODIOS       = 1000
+PASOS_POR_EPISODIO  = 30
+GAMMA               = 0.99
+LAMBDA_GAE          = 0.95
+TASA_APRENDIZAJE    = 3e-4
+COEF_VALOR          = 0.5           # FIX: era 0.01 — el critic necesita gradientes fuertes
+COEF_ENTROPIA       = 0.03          # ligeramente aumentado para explorar mas
+EPSILON_INICIO      = 0.5
+EPSILON_FIN         = 0.05
+CHECKPOINT_CADA     = 100
+CARPETA_CKPT        = os.path.join("checkpoints", "run6")
+CARPETA_MEJOR       = "checkpoints"
+TAM_BANCO_OMEGA     = 10
+OMEGA_RANGE_TRAIN   = 2.0
 
 optimizador = tf.keras.optimizers.Adam(learning_rate=TASA_APRENDIZAJE)
-
-# Creamos el directorio de checkpoints si todavía no existe
 os.makedirs(CARPETA_CKPT, exist_ok=True)
+os.makedirs(CARPETA_MEJOR, exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Banco de omega fijo — SOLO para metrica oficial (comparable a runs previas)
+# ─────────────────────────────────────────────────────────────────────────────
+
+np.random.seed(42)
+BANCO_OMEGA = [
+    np.random.uniform(-OMEGA_RANGE, OMEGA_RANGE, N)
+    for _ in range(TAM_BANCO_OMEGA)
+]
+np.random.seed(None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,340 +96,351 @@ os.makedirs(CARPETA_CKPT, exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def indice_a_arista(indice, n):
-    """
-    Convierte el índice entero que devuelve la red neuronal al par de nodos
-    (i, j) que identifica la arista correspondiente.
-
-    El mapeo sigue el triángulo superior de la matriz (i < j):
-        índice 0   → (0, 1)
-        índice 1   → (0, 2)  ...
-        índice n-2 → (0, n-1)
-        índice n-1 → (1, 2)  ...
-
-    Parámetros
-    ----------
-    indice : int
-        Número entre 0 y NUM_ACCIONES-1 producido por el modelo.
-    n : int
-        Cantidad de nodos del grafo.
-
-    Retorna
-    -------
-    (i, j) : tuple[int, int]   con i < j
-    """
     contador = 0
     for i in range(n):
         for j in range(i + 1, n):
             if contador == indice:
                 return (i, j)
             contador += 1
-    raise ValueError(
-        f"Índice {indice} fuera de rango para un grafo de {n} nodos "
-        f"(máximo permitido: {n*(n-1)//2 - 1})"
-    )
+    raise ValueError(f"Indice {indice} fuera de rango")
 
 
 def aplicar_accion(W, accion):
-    """
-    Modifica la matriz de adyacencia W según la acción elegida por el modelo.
-
-    La acción es un flip: si la arista (i,j) existe se elimina; si no existe
-    se agrega. La simetría se mantiene actualizando W[i,j] y W[j,i].
-
-    Parámetros
-    ----------
-    W : np.ndarray, shape (N, N)
-        Matriz de adyacencia actual del grafo.
-    accion : int
-        Índice de la arista a modificar (salida del modelo).
-
-    Retorna
-    -------
-    W_nueva : np.ndarray, shape (N, N)
-        Copia de W con la arista modificada.
-    (i, j) : tuple[int, int]
-        Par de nodos cuya arista fue modificada.
-    """
-    n = W.shape[0]
-    i, j = indice_a_arista(accion, n)
-
-    # Trabajamos sobre una copia para no alterar el estado anterior
+    i, j = indice_a_arista(accion, W.shape[0])
     W_nueva = np.array(W, dtype=float)
-
-    # Toggle: eliminamos la arista si existe, la creamos si no existe
     if W_nueva[i, j] == 1:
-        W_nueva[i, j] = 0  # eliminamos arista i→j
-        W_nueva[j, i] = 0  # y su simétrica j→i (grafo no dirigido)
+        W_nueva[i, j] = W_nueva[j, i] = 0
     else:
-        W_nueva[i, j] = 1  # creamos arista i→j
-        W_nueva[j, i] = 1  # y su simétrica j→i (grafo no dirigido)
-
+        W_nueva[i, j] = W_nueva[j, i] = 1
     return W_nueva, (i, j)
 
 
-def preparar_entradas(theta, W):
+def preparar_entradas(theta, omega, W):
+    features = np.stack([np.sin(theta), np.cos(theta), omega], axis=-1)
+    return (
+        features.reshape(1, N, 3).astype(np.float32),
+        W.reshape(1, N, N).astype(np.float32)
+    )
+
+
+def preparar_batch(estados):
+    """Apila todos los estados del episodio en tensores para un forward pass unico.
+
+    En lugar de llamar al modelo 30 veces en bucle (como Run 5), preparamos
+    tensores de forma (T, N, F) y procesamos todo en una sola llamada.
+    Esto reduce el overhead de Python/TF de 30x a 1x.
     """
-    Convierte los datos del grafo al formato que espera el modelo de Spektral.
+    T = len(estados)
+    node_batch = np.zeros((T, N, 3), dtype=np.float32)
+    W_batch    = np.zeros((T, N, N), dtype=np.float32)
+    for k, (th, om, Wt) in enumerate(estados):
+        node_batch[k] = np.stack([np.sin(th), np.cos(th), om], axis=-1)
+        W_batch[k]    = Wt
+    return node_batch, W_batch
 
-    Entradas del modelo:
-      - theta_in : tensor denso de shape (1, N, 1) — fases de los nodos
-      - W_in     : scipy.sparse CSR — matriz de adyacencia (sparse=True en Spektral)
 
-    Parámetros
-    ----------
-    theta : np.ndarray, shape (N,)
-    W     : np.ndarray, shape (N, N)
+def grafo_vacio(n):
+    return np.zeros((n, n), dtype=float)
+
+
+def normalizar(arr):
+    return (arr - np.mean(arr)) / (np.std(arr) + 1e-8)
+
+
+def epsilon_actual(ep_relativo, total_eps):
+    """Decaimiento lineal de epsilon relativo al run actual (no al indice absoluto).
+
+    ep_relativo: episodio dentro del run actual (0-indexed).
+    total_eps:   total de episodios de este run.
+    """
+    fraccion = ep_relativo / max(total_eps - 1, 1)
+    return EPSILON_INICIO + fraccion * (EPSILON_FIN - EPSILON_INICIO)
+
+
+def evaluar_grafo_banco(W, theta):
+    """Evalua el grafo final promediando sobre el banco fijo (seed=42, rango 1.0).
+
+    Metrica oficial de comparacion — misma que Runs 2-5 y el baseline aleatorio.
+    No se usa para generar gradientes de entrenamiento.
+    """
+    rews, r_fins = [], []
+    conn = 0.0
+    for omega_k in BANCO_OMEGA:
+        rew_arr, conn_k, r_arr = evaluar_grafo(W, theta, omega_k)
+        rews.append(float(np.mean(rew_arr)))
+        conn = conn_k
+        r_fins.append(float(r_arr[-1]))
+    return float(np.mean(rews)), conn, float(np.mean(r_fins))
+
+
+def calcular_gae(recompensas, valores, gamma, lam):
+    """
+    Generalized Advantage Estimation (GAE-lambda).
+
+        delta_t  = r_t + gamma * V(s_{t+1}) - V(s_t)
+        A_t^GAE  = sum_{l=0}^{T-1-t}  (gamma * lam)^l * delta_{t+l}
 
     Retorna
     -------
-    theta_tensor : np.ndarray, shape (1, N, 1), dtype float32
-    W_sparse     : scipy.sparse.csr_matrix, shape (N, N), dtype float32
-    """
-    theta_tensor = theta.reshape(1, N, 1).astype(np.float32)
-    W_sparse     = sp.csr_matrix(W.astype(np.float32))
-    return theta_tensor, W_sparse
-
-
-def grafo_aleatorio(n):
-    """
-    Genera una matriz de adyacencia aleatoria para un grafo no dirigido sin
-    lazos (sin aristas de un nodo consigo mismo).
-
-    Retorna
-    -------
-    W : np.ndarray, shape (n, n) — valores 0/1, simétrica, diagonal cero.
-    """
-    # Construimos el triángulo superior y lo reflejamos para obtener simetría
-    W_upper = np.triu(np.random.randint(0, 2, (n, n)), k=1)
-    return (W_upper + W_upper.T).astype(float)
-
-
-def calcular_retornos(recompensas, gamma):
-    """
-    Calcula los retornos descontados G_t para cada paso del episodio.
-
-    G_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + ...
-
-    Usar retornos descontados en vez de la recompensa inmediata reduce la
-    varianza del gradiente (principio fundamental de REINFORCE).
-
-    Parámetros
-    ----------
-    recompensas : list[float]
-        Recompensas recibidas en cada paso del episodio.
-    gamma : float
-        Factor de descuento (0 < gamma ≤ 1).
-
-    Retorna
-    -------
-    retornos : np.ndarray, shape (T,)
+    ventajas_norm : ndarray (T,)  — ventajas GAE normalizadas (para el actor)
+    retornos_gae  : ndarray (T,)  — targets del critic: A_t^GAE + V(s_t)
     """
     T = len(recompensas)
-    retornos = np.zeros(T)
-    G = 0.0
-    # Recorremos al revés para acumular el retorno futuro eficientemente
+    ventajas = np.zeros(T, dtype=np.float64)
+    gae = 0.0
     for t in reversed(range(T)):
-        G = recompensas[t] + gamma * G
-        retornos[t] = G
-    return retornos
+        V_t  = valores[t]
+        V_t1 = valores[t + 1] if t + 1 < T else 0.0
+        delta = recompensas[t] + gamma * V_t1 - V_t
+        gae   = delta + gamma * lam * gae
+        ventajas[t] = gae
 
-
-def normalizar_retornos(retornos):
-    """
-    Centra y escala los retornos (media 0, desvío 1).
-
-    Esto es una técnica estándar de reducción de varianza en Policy Gradient:
-    hace que el gradiente no dependa de la escala absoluta de las recompensas
-    y acelera la convergencia.
-
-    Parámetros
-    ----------
-    retornos : np.ndarray
-
-    Retorna
-    -------
-    retornos normalizados : np.ndarray
-    """
-    media  = np.mean(retornos)
-    desvio = np.std(retornos) + 1e-8  # epsilon para evitar división por cero
-    return (retornos - media) / desvio
+    retornos_gae  = ventajas + np.array(valores, dtype=np.float64)
+    ventajas_norm = normalizar(ventajas)
+    return ventajas_norm, retornos_gae
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Bucle principal de entrenamiento (REINFORCE / Policy Gradient)
+#  RESUME: detectar el ultimo checkpoint y continuar desde ahi
+#
+#  FIX vs Run 5: EPISODIO_FIN = EPISODIO_INICIO + NUM_EPISODIOS siempre.
+#  Run 5 usaba range(EPISODIO_INICIO, NUM_EPISODIOS) lo que causaba que si
+#  EPISODIO_INICIO >= NUM_EPISODIOS el bucle nunca se ejecutara (output6.log).
 # ─────────────────────────────────────────────────────────────────────────────
-#
-#  Estructura de cada episodio:
-#    1. RECOLECCIÓN: el modelo toma decisiones sobre el grafo sin calcular
-#       gradientes (training=False). Guardamos (estado, acción, recompensa).
-#    2. CÓMPUTO DE RETORNOS: calculamos G_t descontados y los normalizamos.
-#    3. ACTUALIZACIÓN: re-corremos el modelo dentro de tf.GradientTape para
-#       calcular log_prob(acción) y la pérdida REINFORCE = -log_prob * G_t.
-#       Luego aplicamos los gradientes con Adam.
-#
+
+def detectar_ultimo_checkpoint():
+    """Retorna (episodio_inicio, mejor_score_banco_previo, historial_previo)."""
+    patron = "modelo_ep"
+    episodios_guardados = []
+    for fname in os.listdir(CARPETA_CKPT):
+        if fname.startswith(patron) and fname.endswith(".weights.h5"):
+            try:
+                n = int(fname[len(patron):-len(".weights.h5")])
+                episodios_guardados.append(n)
+            except ValueError:
+                pass
+
+    if not episodios_guardados:
+        return 0, -np.inf, []
+
+    ultimo    = max(episodios_guardados)
+    ckpt_path = os.path.join(CARPETA_CKPT, f"modelo_ep{ultimo}.weights.h5")
+
+    _dummy_node = np.zeros((1, N, 3), dtype=np.float32)
+    _dummy_W    = np.zeros((1, N, N), dtype=np.float32)
+    model([_dummy_node, _dummy_W], training=False)
+    model.load_weights(ckpt_path)
+    print(f"  [RESUME] Pesos cargados desde: {ckpt_path}")
+
+    mejor_prev = -np.inf
+    hist_path  = os.path.join(CARPETA_CKPT, "historial_run6.json")
+    if os.path.exists(hist_path):
+        with open(hist_path) as f:
+            hist_prev = json.load(f)
+        if hist_prev:
+            mejor_prev = max(e["score_banco"] for e in hist_prev)
+        print(f"  [RESUME] Historial cargado: {len(hist_prev)} episodios previos.")
+        print(f"  [RESUME] Mejor score banco previo: {mejor_prev:.4f}")
+    else:
+        hist_prev = []
+
+    return ultimo, mejor_prev, hist_prev
+
+
+# ── Intentar resume ──────────────────────────────────────────────────────────
+
+EPISODIO_INICIO, mejor_recompensa, historial_metricas = detectar_ultimo_checkpoint()
+
+# FIX CRITICO: siempre entrenar NUM_EPISODIOS episodios nuevos desde el punto
+# de resume. Run 5 usaba range(inicio, NUM_EPISODIOS) que terminaba vacio si
+# inicio >= NUM_EPISODIOS (caso exacto de output6.log donde inicio=200).
+EPISODIO_FIN = EPISODIO_INICIO + NUM_EPISODIOS
+
+if EPISODIO_INICIO > 0:
+    print(f"  [RESUME] Continuando desde episodio {EPISODIO_INICIO + 1} hasta {EPISODIO_FIN}\n")
+else:
+    print(f"  [RESUME] No se encontraron checkpoints. Arrancando desde cero.\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Bucle principal
 # ─────────────────────────────────────────────────────────────────────────────
 
 print("=" * 70)
-print(f"  ENTRENAMIENTO REINFORCE")
+print("  ENTRENAMIENTO ACTOR-CRITIC (A2C + GAE) — Run 6")
 print(f"  Grafo: {N} nodos | {NUM_ACCIONES} acciones posibles")
-print(f"  {NUM_EPISODIOS} episodios × {PASOS_POR_EPISODIO} pasos | γ={GAMMA} | lr={TASA_APRENDIZAJE}")
-print(f"  Checkpoints en: ./{CARPETA_CKPT}/")
+print(f"  {NUM_EPISODIOS} episodios x {PASOS_POR_EPISODIO} pasos | "
+      f"gamma={GAMMA} | lambda_gae={LAMBDA_GAE} | lr={TASA_APRENDIZAJE}")
+print(f"  coef_valor={COEF_VALOR} | coef_entropia={COEF_ENTROPIA}")
+print(f"  epsilon: {EPSILON_INICIO} -> {EPSILON_FIN} (decay lineal por run)")
+print(f"  omega train: fresco por episodio | OMEGA_RANGE_TRAIN={OMEGA_RANGE_TRAIN}")
+print(f"  omega eval:  banco fijo (seed=42, rango {OMEGA_RANGE}) — comparable a runs previas")
+print(f"  reward: DENSO — evaluar en cada paso | loss: normalizada por pasos")
+print(f"  forward pass: VECTORIZADO (1 llamada por episodio, no 30)")
+print(f"  Entrenando episodios: {EPISODIO_INICIO + 1} -> {EPISODIO_FIN}")
 print("=" * 70 + "\n")
 
-mejor_recompensa    = -np.inf          # para detectar nuevos récords
-historial_metricas  = []               # guardado en JSON al finalizar
+score_ventana = []   # para promedio movil de las ultimas 20 evaluaciones
 
-for episodio in range(NUM_EPISODIOS):
+for episodio in range(EPISODIO_INICIO, EPISODIO_FIN):
 
-    # ── 1. Estado inicial del episodio ───────────────────────────────────────
+    # ── 1. Estado inicial ────────────────────────────────────────────────────
 
-    W             = grafo_aleatorio(N)
+    W             = grafo_vacio(N)
     theta_inicial = np.random.uniform(-np.pi, np.pi, N)
+    omega_train   = np.random.uniform(-OMEGA_RANGE_TRAIN, OMEGA_RANGE_TRAIN, N)
 
-    # Trayectoria: guardamos el estado ANTES de cada acción para poder
-    # re-correr el forward pass dentro del tape en la fase de actualización
-    estados     = []   # lista de (theta, W_antes_de_accion)
-    acciones    = []   # acción elegida en cada paso
-    recompensas = []   # recompensa inmediata de cada paso
+    # Epsilon relativo al run actual (no al indice absoluto)
+    ep_relativo = episodio - EPISODIO_INICIO
+    eps         = epsilon_actual(ep_relativo, NUM_EPISODIOS)
 
-    recompensa_acumulada = 0.0
-    conectividad_final   = 0.0
-    r_final              = 0.0
-    pasos_validos        = 0
+    estados     = []
+    acciones    = []
+    recompensas = []
+    pasos_validos = 0
 
-    # ── 2. Fase de recolección (sin gradientes) ──────────────────────────────
+    # ── 2. Recoleccion (reward DENSO — evaluar en cada paso) ─────────────────
 
     for paso in range(PASOS_POR_EPISODIO):
         try:
-            theta_tensor, W_sparse = preparar_entradas(theta_inicial, W)
+            node_t, W_t = preparar_entradas(theta_inicial, omega_train, W)
+            probs, _    = model([node_t, W_t], training=False)
+            probs       = probs.numpy()[0]
 
-            # Inferencia sin gradientes: solo nos interesa la acción elegida
-            probs  = model([theta_tensor, W_sparse], training=False).numpy()[0]
+            if np.random.random() < eps:
+                accion = np.random.randint(NUM_ACCIONES)
+            else:
+                accion = np.random.choice(NUM_ACCIONES, p=probs)
 
-            # Muestreo estocástico: exploración proporcional a las probabilidades
-            accion = np.random.choice(NUM_ACCIONES, p=probs)
+            W_nueva, _ = aplicar_accion(W, accion)
 
-            # Aplicamos la acción al grafo
-            W_nueva, (i, j) = aplicar_accion(W, accion)
+            recompensa_paso, _, _ = evaluar_grafo_rapido(
+                W_nueva, theta_inicial, omega_train
+            )
 
-            # Evaluamos el nuevo grafo con la dinámica de Kuramoto
-            # evaluar_grafo devuelve: (array recompensas, escalar conectividad, array r)
-            recompensa_arr, conectividad, r_arr = evaluar_grafo(W_nueva, theta_inicial)
-            recompensa_paso = float(np.mean(recompensa_arr))
-
-            # Guardamos el estado ANTES de aplicar la acción (para el replay en el tape)
-            estados.append((theta_inicial.copy(), W.copy()))
+            estados.append((theta_inicial.copy(), omega_train.copy(), W.copy()))
             acciones.append(accion)
             recompensas.append(recompensa_paso)
 
-            recompensa_acumulada += recompensa_paso
-            conectividad_final    = conectividad
-            r_final               = float(r_arr[-1])
-            pasos_validos        += 1
-
-            # Avanzamos al siguiente estado
+            pasos_validos += 1
             W = W_nueva
 
         except Exception as e:
-            # Si la simulación numérica es inestable, saltamos este paso
-            print(f"  ⚠  Episodio {episodio+1}, paso {paso+1} saltado: {e}")
+            print(f"  [!] Ep {episodio+1}, paso {paso+1}: {e}")
 
-    # Si todos los pasos fallaron, no hay nada que entrenar
     if pasos_validos == 0:
-        print(f"Ep {episodio+1:3d} | Sin pasos válidos, se omite.\n")
+        print(f"Ep {episodio+1:5d} | Sin pasos validos, se omite.")
         continue
 
-    # ── 3. Cómputo de retornos descontados ───────────────────────────────────
+    # ── 3. Metrica oficial: banco evaluation del grafo final ─────────────────
 
-    retornos      = calcular_retornos(recompensas, GAMMA)
-    retornos_norm = normalizar_retornos(retornos)
+    score_banco, conectividad_final, r_final = evaluar_grafo_banco(W, theta_inicial)
 
-    # ── 4. Actualización de pesos con tf.GradientTape (REINFORCE) ────────────
+    # ── 4. GAE: forward pass VECTORIZADO para calcular V(s_t) ────────────────
     #
-    #  Re-corremos el modelo para cada paso DENTRO del tape. Esto le permite
-    #  a TensorFlow calcular ∂loss/∂pesos, donde:
+    #  FIX de rendimiento vs Run 5: en lugar de llamar al modelo 30 veces en
+    #  un bucle Python, apilamos todos los estados en un tensor (30, N, F) y
+    #  hacemos UNA sola llamada. Mismo resultado, ~30x menos overhead.
+
+    node_b, W_b = preparar_batch(estados)
+    _, vals_batch = model([node_b, W_b], training=False)
+    valores_np = tf.squeeze(vals_batch, axis=1).numpy().tolist()
+
+    ventajas_norm, retornos_gae = calcular_gae(
+        recompensas, valores_np, GAMMA, LAMBDA_GAE
+    )
+
+    # ── 5. Actualizacion A2C + GAE (forward pass VECTORIZADO dentro del tape) ─
     #
-    #    loss = - Σ_t  log( π(a_t | s_t) ) * G_t
-    #
-    #  El signo negativo convierte la maximización de la recompensa esperada
-    #  en un problema de minimización de pérdida (convención de optimizadores).
-    #
-    # ─────────────────────────────────────────────────────────────────────────
+    #  Mismo principio: una sola llamada a model() con batch (T, N, F) en lugar
+    #  de 30 llamadas en bucle. El grafo de TF es mas compacto, los gradientes
+    #  son identicos matematicamente pero mucho mas rapidos de calcular.
 
     with tf.GradientTape() as tape:
-        loss_total = tf.constant(0.0)
+        probs_b, vals_b = model([node_b, W_b], training=True)
 
-        for (theta_t, W_t), accion_t, G_t in zip(estados, acciones, retornos_norm):
+        adv_tf = tf.constant(ventajas_norm.astype(np.float32))   # (T,)
+        ret_tf = tf.constant(retornos_gae.astype(np.float32))    # (T,)
 
-            # Preparamos las entradas del paso t
-            theta_tensor_t, W_sparse_t = preparar_entradas(theta_t, W_t)
+        # Gather log-probabilidades de las acciones tomadas
+        indices   = tf.stack([
+            tf.range(pasos_validos, dtype=tf.int32),
+            tf.constant(acciones,   dtype=tf.int32)
+        ], axis=1)
+        log_probs = tf.math.log(tf.gather_nd(probs_b, indices) + 1e-8)  # (T,)
 
-            # Forward pass con training=True para que el tape registre las ops
-            probs_t = model([theta_tensor_t, W_sparse_t], training=True)
+        loss_actor    = -tf.reduce_sum(log_probs * adv_tf)
 
-            # Log-probabilidad de la acción que tomamos (estabilizado con ε)
-            log_prob = tf.math.log(probs_t[0, accion_t] + 1e-8)
+        vals_sq       = tf.squeeze(vals_b, axis=1)                       # (T,)
+        loss_critic   = tf.reduce_sum(tf.square(ret_tf - vals_sq))
 
-            # Acumulamos la pérdida REINFORCE: -log_prob * retorno_descontado
-            loss_total = loss_total - log_prob * float(G_t)
+        entropy       = -tf.reduce_sum(
+            probs_b * tf.math.log(probs_b + 1e-8), axis=-1
+        )                                                                 # (T,)
+        loss_entropia = -tf.reduce_sum(entropy)
 
-    # Calculamos gradientes de la pérdida respecto a los pesos del modelo
+        # Normalizar por numero de pasos (estabiliza escala independiente de T)
+        loss_total = (
+            loss_actor + COEF_VALOR * loss_critic + COEF_ENTROPIA * loss_entropia
+        ) / pasos_validos
+
     gradientes = tape.gradient(loss_total, model.trainable_variables)
-
-    # Gradient clipping: evita explosión de gradientes en redes recurrentes/GCN
-    gradientes, norma_global = tf.clip_by_global_norm(gradientes, clip_norm=1.0)
-
-    # Aplicamos los gradientes con Adam
+    gradientes, grad_norm = tf.clip_by_global_norm(gradientes, clip_norm=1.0)
     optimizador.apply_gradients(zip(gradientes, model.trainable_variables))
 
     loss_valor = float(loss_total)
 
-    # ── 5. Checkpoints y guardado de métricas ────────────────────────────────
+    # ── 6. Checkpoints ───────────────────────────────────────────────────────
 
-    # Detectamos si este episodio logró la mejor recompensa hasta ahora
-    es_nuevo_mejor = recompensa_acumulada > mejor_recompensa
-
+    es_nuevo_mejor = score_banco > mejor_recompensa
     if es_nuevo_mejor:
-        mejor_recompensa = recompensa_acumulada
-
-        # Guardamos los pesos del modelo que logró el mejor desempeño
-        model.save_weights(os.path.join(CARPETA_CKPT, "mejor_modelo.weights.h5"))
-
-        # Guardamos también la topología del mejor grafo encontrado
-        with open(os.path.join(CARPETA_CKPT, "mejor_grafo.json"), "w") as f:
+        mejor_recompensa = score_banco
+        model.save_weights(os.path.join(CARPETA_MEJOR, "mejor_modelo.weights.h5"))
+        with open(os.path.join(CARPETA_MEJOR, "mejor_grafo.json"), "w") as f:
             json.dump({
-                "episodio"            : episodio + 1,
-                "recompensa_acumulada": recompensa_acumulada,
-                "conectividad"        : conectividad_final,
-                "r_final"             : r_final,
-                "W"                   : W.tolist()   # matriz de adyacencia final del episodio
+                "episodio"    : episodio + 1,
+                "score_banco" : score_banco,
+                "conectividad": conectividad_final,
+                "r_final"     : r_final,
+                "omega_train" : omega_train.tolist(),
+                "W"           : W.tolist()
             }, f, indent=2)
 
-    # Checkpoint periódico cada CHECKPOINT_CADA episodios
     if (episodio + 1) % CHECKPOINT_CADA == 0:
-        ruta_ckpt = os.path.join(CARPETA_CKPT, f"modelo_ep{episodio+1}.weights.h5")
-        model.save_weights(ruta_ckpt)
+        ckpt_path = os.path.join(CARPETA_CKPT, f"modelo_ep{episodio+1}.weights.h5")
+        model.save_weights(ckpt_path)
+        with open(os.path.join(CARPETA_CKPT, "historial_run6.json"), "w") as f:
+            json.dump(historial_metricas, f, indent=2)
+        print(f"  [CKPT] Guardado checkpoint ep{episodio+1} y historial.")
 
-    # Registramos las métricas del episodio para el historial
     historial_metricas.append({
-        "episodio"            : episodio + 1,
-        "loss"                : loss_valor,
-        "recompensa_acumulada": recompensa_acumulada,
-        "conectividad"        : conectividad_final,
-        "r_final"             : r_final,
-        "pasos_validos"       : pasos_validos
+        "episodio"     : episodio + 1,
+        "loss"         : loss_valor,
+        "score_banco"  : score_banco,
+        "conectividad" : conectividad_final,
+        "r_final"      : r_final,
+        "epsilon"      : round(eps, 4),
+        "pasos_validos": pasos_validos,
+        "grad_norm"    : float(grad_norm)
     })
 
-    # ── 6. Reporte del episodio ───────────────────────────────────────────────
+    # ── 7. Reporte ───────────────────────────────────────────────────────────
 
-    marca = " ★ NUEVO MEJOR" if es_nuevo_mejor else ""
+    score_ventana.append(score_banco)
+    if len(score_ventana) > 20:
+        score_ventana.pop(0)
+    avg20 = sum(score_ventana) / len(score_ventana)
+
+    marca = " *** NUEVO MEJOR" if es_nuevo_mejor else ""
     print(
-        f"Ep {episodio+1:3d}/{NUM_EPISODIOS} | "
-        f"Loss: {loss_valor:+9.4f} | "
-        f"Recompensa: {recompensa_acumulada:+7.4f} | "
-        f"Conectividad: {conectividad_final:.4f} | "
-        f"r: {r_final:.4f} | "
-        f"Pasos: {pasos_validos}/{PASOS_POR_EPISODIO}"
+        f"Ep {episodio+1:5d}/{EPISODIO_FIN} | "
+        f"Loss: {loss_valor:+8.4f} | "
+        f"Score: {score_banco:+7.4f} | "
+        f"Avg20: {avg20:+7.4f} | "
+        f"Conn: {conectividad_final:.3f} | "
+        f"r: {r_final:.3f} | "
+        f"gNorm: {float(grad_norm):.3f} | "
+        f"eps: {eps:.2f}"
         f"{marca}"
     )
 
@@ -386,15 +448,14 @@ for episodio in range(NUM_EPISODIOS):
 #  Guardado final
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Guardamos los pesos del modelo al finalizar el entrenamiento completo
 model.save_weights(os.path.join(CARPETA_CKPT, "modelo_final.weights.h5"))
 
-# Guardamos el historial completo de métricas en JSON para análisis posterior
-with open(os.path.join(CARPETA_CKPT, "historial.json"), "w") as f:
+with open(os.path.join(CARPETA_CKPT, "historial_run6.json"), "w") as f:
     json.dump(historial_metricas, f, indent=2)
 
 print("\n" + "=" * 70)
 print(f"  Entrenamiento finalizado.")
-print(f"  Mejor recompensa acumulada: {mejor_recompensa:.4f}")
+print(f"  Mejor score banco: {mejor_recompensa:.4f}")
+print(f"  Baseline a superar: +0.093  (busqueda aleatoria 10k muestras)")
 print(f"  Archivos guardados en: ./{CARPETA_CKPT}/")
 print("=" * 70)

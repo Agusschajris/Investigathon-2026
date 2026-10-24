@@ -1,0 +1,7 @@
+23/10/26 - Primera run del codigo de entrenamiento fallida
+Output:
+======================================================================
+  Entrenamiento finalizado.
+  Mejor recompensa acumulada: -inf
+  Archivos guardados en: ./checkpoints/
+======================================================================
