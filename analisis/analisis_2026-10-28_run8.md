@@ -153,26 +153,68 @@ Sin embargo, la gNorm crece durante la run: de 0.334 (Q1) a 0.576 (Q4). Esto ind
 
 ## 4. Grafo con mejor relación: conectividad alta + desincronización
 
-### 4.1 El mejor grafo encontrado
+### 4.1 Aclaración crucial: r_final vs r_trayectoria
 
-El mejor grafo de la run fue producido en el **episodio 999** con:
+El historial registra dos métricas de sincronización distintas que conviene no confundir:
 
-| Métrica | Valor |
-|---------|-------|
-| Score banco | **−0.0290** (nuevo récord histórico del proyecto) |
-| Conectividad | **0.840** (194/231 aristas) |
-| r_final | **0.9995** |
-| Episodio | 999 |
+- **r_final**: el parámetro de orden Kuramoto al **último instante** de la simulación (t=5s). Este valor es siempre ≈0.9995 — todos los grafos de Run 8 sincronizan por completo al final de los 5 segundos.
+- **r_trayectoria** (implícito en el score): el promedio de r(t) a lo largo de **toda** la simulación. Se recupera como `r_tray = conn − score`. Este valor sí varía entre grafos (rango: 0.869–0.938).
 
-**Descripción estructural:** el mejor grafo es W_conocido (circulante N=22, l=7) con 40 aristas adicionales. La estructura resultante tiene 194 aristas, 21 nodos con grado ≥ 17, y la mayoría de los nodos con conectividad local muy alta. Las aristas añadidas conectan principalmente nodos con distancia ≥ 8 en el anillo original (las aristas de "largo alcance"), lo que tiende a homogeneizar el grafo acercándolo al grafo completo.
+El score del banco mide `conn − r_tray`, no `conn − r_final`. Por lo tanto, **la métrica correcta para evaluar "mejor relación conectividad alta / desincronización" es r_trayectoria**, no r_final. Un grafo que tarda más en sincronizarse —manteniendo r bajo durante más tiempo— tiene menor r_tray y mayor score.
 
-**Paradoja observada:** a pesar de ser el mejor grafo de la run, r=0.9995 indica sincronización casi perfecta. El score es el mejor únicamente porque conn=0.840 es consistentemente alta — no porque r sea baja. En términos del objetivo real (desincronización), **ningún grafo de Run 8 logró desincronizar el sistema**.
+```
+Estadísticas r_trayectoria (Run 8, 1000 episodios):
+  mínimo:  0.8689   (ep 999 — mejor grafo)
+  máximo:  0.9379
+  media:   0.9034
+  std:     0.0123
 
-### 4.2 Por qué conn=0.840 + r≈1.0 no es el objetivo
+Estadísticas r_final (Run 8, todos los episodios):
+  mínimo:  0.9994   ← todos los grafos sincronizan al final
+  máximo:  0.9995
+  std:     0.00001  ← variación prácticamente nula
+```
 
-El score del mejor grafo (−0.0290) es significativamente mejor que Run 6 (−0.1551), pero la razón es puramente geométrica: para N=22, la misma fórmula conn−r con conn=0.840 da un piso de ~−0.16 (si r=1.0) y un techo de ~+0.74 (si r=0). El mejor grafo obtiene −0.0290 porque conn aporta +0.840 y r substrae −0.999, diferencia que resulta en −0.159... pero con media del banco de −0.0290, lo que implica que algunos vectores omega del banco generan r algo menor que 1.0 (aunque igualmente cercano).
+Distribución de r_trayectoria:
+```
+r_tray [0.86, 0.87):   2 eps  (0.2%)  ← mejor rango
+r_tray [0.87, 0.88):  22 eps  (2.2%)
+r_tray [0.88, 0.89): 134 eps (13.4%)
+r_tray [0.89, 0.90): 240 eps (24.0%)
+r_tray [0.90, 0.91): 277 eps (27.7%)  ← moda
+r_tray [0.91, 0.92): 242 eps (24.2%)
+r_tray [0.92, 0.93):  79 eps  (7.9%)
+r_tray [0.93, 0.94):   4 eps  (0.4%)  ← peor rango
+```
 
-El grafo óptimo del problema sería uno con conn ≥ 0.69 y r ≈ 0. Run 8 encontró el primero pero no el segundo.
+### 4.2 El grafo con mejor relación conectividad alta / desincronización
+
+El grafo que logra la **mayor conectividad con menor sincronización** de toda Run 8 fue producido en el **episodio 999**:
+
+| Métrica | Valor | Interpretación |
+|---------|-------|----------------|
+| Episodio | **999** | Último episodio de la run |
+| Score banco | **−0.0290** | Nuevo récord histórico del proyecto |
+| Conectividad | **0.840** | 194/231 aristas (la máxima posible en esta run) |
+| r_trayectoria | **0.8689** | Promedio de r(t) durante los 5s → menor sincronización lograda |
+| r_final (t=5s) | 0.9995 | El sistema termina sincronizado igual que todos |
+
+**Interpretación física:** este grafo logra que el sistema de Kuramoto pase más tiempo en estado desincronizado durante la trayectoria antes de converger a sincronía. Con r_tray=0.869, el sistema promedia un nivel de coherencia de solo 0.87 durante los 5 segundos (en contraste con el peor grafo de la run, donde el promedio es 0.938). La diferencia es que la sincronización llega más tarde o de forma más gradual.
+
+**Todos los grafos de la run comparten la misma conectividad** (0.840 = constante por diseño). Por lo tanto, el grafo del ep 999 es el que mejor cumple el objetivo del proyecto de forma simultánea:
+- ✅ Conectividad alta: **0.840** (máxima posible en esta run, supera la cota 0.69)
+- ✅ Sincronización baja durante la trayectoria: **r_tray = 0.869** (mínimo de la run)
+
+**Comparación con el peor grafo** de la run (ep 41, r_tray=0.938, score=−0.0877): mismo W_conocido de base, misma conectividad final, pero la topología resultante sincroniza con más fuerza y rapidez. La diferencia radica en qué 40 aristas residuales eligió el agente añadir.
+
+### 4.3 Limitación: desincronización temporal, no permanente
+
+El hallazgo fundamental es que **ningún grafo de Run 8 logró desincronización permanente**. Todos terminan con r(t=5s) ≈ 0.999. El mejor grafo solo logra demorar la sincronización. Esto tiene dos causas:
+
+1. El grafo circulante N=22 con omega rango 1.0 tiene acoplamiento suficiente para sincronizar en 5s para cualquier topología con conn≈0.84.
+2. El twisted state inicial (θᵢ = 2πi/22) es una condición que favorece el acoplamiento rotacional, no la desincronización persistente.
+
+Para lograr desincronización **permanente** (r pequeño al final), la señal correcta sería minimizar r_final directamente — algo que requeriría cambiar el estado inicial de fases o explorar topologías que rompan el acoplamiento efectivo entre osciladores.
 
 ---
 
