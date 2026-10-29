@@ -4,3 +4,7 @@ venv/
 __pycache__/
 claude/
 output.log
+
+# Pesos de modelos (binarios grandes, se regeneran entrenando)
+*.weights.h5
+*.h5
