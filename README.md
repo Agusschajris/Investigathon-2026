@@ -11,4 +11,4 @@ Instalación:
 
 En la última versión del repo (branch run8-grafo-conocido) se puede correr el archivo `entrenamiento.py` para correr la última RUN 8 (para runs anteriores habría que volver a main y ver versiones anteriores del repo). También, en main, se pueden correr los archivos `busqueda_aleatoria.py` para el Baseline Aleatorio y `busqueda_dirigida.py` para el Simulated Annealing.
 
-Los resultados de la investigación (gráficos y animaciones) se pueden ver en `resultados_runs.ipynb` en la carpeta `/analisis`
+Los resultados de la investigación (gráficos y animaciones) se pueden ver en `resultados_runs.ipynb` en la carpeta `/analisis`. Además, pueden ver nuestro mejor resultado en el archivo `mejor-grafo.jpeg` en la carpeta `/analisis`.
